@@ -3,8 +3,9 @@
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width,initial-scale=1.0,maximum-scale=1.0,user-scalable=no">
-<title>OBSERVE</title>
+<title>OBSERVE — MP</title>
 <style>
+html{zoom:1.08;}
 @font-face{
   font-family:'Inter';
   src:url('Inter/Inter-VariableFont_opsz,wght.ttf') format('truetype');
@@ -75,10 +76,12 @@ body{background:var(--bg);color:var(--tx);font-family:var(--f);font-size:13px;fo
 .upload-circle.eye-gone .upload-lbl{opacity:1;}
 
 /* ══ LOADING ══ */
-.load-center{flex:1;display:flex;align-items:center;justify-content:center;}
+.load-center{flex:1;display:flex;flex-direction:column;align-items:center;justify-content:center;}
 .load-eye{width:130px;height:130px;animation:loadpulse 2s ease-in-out infinite;}
 .load-eye svg{width:130px;height:130px;}
 @keyframes loadpulse{0%,100%{opacity:.9}50%{opacity:.45}}
+.load-progress{width:180px;height:2px;background:rgba(0,0,0,.07);border-radius:1px;overflow:hidden;margin-top:20px;}
+.load-progress-fill{height:100%;background:var(--lbl);width:0%;transition:width .25s;}
 
 /* ══ TRIM ══ */
 .trim-vid-wrap{
@@ -385,8 +388,9 @@ body{background:var(--bg);color:var(--tx);font-family:var(--f);font-size:13px;fo
         <rect class="iris-rect" id="iris-load" x="340" y="328" width="113" height="115" rx="56.5" fill="#5A5A5A"/>
       </svg>
     </div>
+    <div class="load-progress"><div class="load-progress-fill" id="loadProgressFill"></div></div>
   </div>
-  <div class="tagline">Thinked by DD for you to pay (attention)</div>
+  <div class="tagline" id="loadTagline">Loading MediaPipe…</div>
 </div>
 
 <!-- ══ TRIM ══ -->
@@ -545,10 +549,6 @@ const EPRESET=[
   '🐙','🐚','🪸','🪨','🍄','🌅','🌄','🌠','🌌','🏔️','🌋','🌏','🪐','🫧','💧',
   '🌞','🌝',
 ];
-const CV_URLS=[
-  'https://cdn.jsdelivr.net/npm/@techstark/opencv-js@4.10.0-release.1/dist/opencv.js',
-  'https://unpkg.com/@techstark/opencv-js@4.10.0-release.1/dist/opencv.js',
-];
 const CC={
   opacity:{min:5, max:100,step:5, def:90},
   cell:   {min:4, max:28, step:2, def:10},
@@ -556,7 +556,7 @@ const CC={
   glow:   {min:0, max:12, step:1, def:0},
 };
 const RV={opacity:90,cell:10,motion:20,glow:0};
-const TRAIL_DEF=82, EDGE_DEF=55, VIDEO_DEF=100;
+const TRAIL_DEF=82, EDGE_DEF=22, VIDEO_DEF=100;
 const FPS=30, FMS=1000/FPS;
 
 // ══ DOM ══
@@ -576,19 +576,90 @@ const gWord=$('gWord'),gWordFont=$('gWordFont');
 const expBtn=$('expBtn'),expArr=$('expArr');
 const expModal=$('expModal'),mTitle=$('mTitle'),mSub=$('mSub'),mBar=$('mBar'),mCancelBtn=$('mCancelBtn');
 const sStage=$('s-stage');
+const loadProgressFill=$('loadProgressFill'),loadTagline=$('loadTagline');
 
 // ══ STATE ══
 let mediaEl=null,raf=null,prevPx=null,trailBuf=null,playing=false;
 let trimStart=0,trimEnd=0,vidDur=0,trimDrag=null,trimFileURL=null;
-let expCancelled=false,mogSub=null,motMask=null,cvReady=false,frameCount=0;
+let expCancelled=false,motMask=null,frameCount=0;
 let inStage=false,sensVal=50;
 let srcW=0,srcH=0,_edge=null,_angle=null,_px=null,_W=0,_H=0;
 let activeCtrl=null,activeRow=null;
 const zone={gfxType:'emoji',wordText:'FLOW',wordFont:'Arial Black',wordMode:'whole',
   emojis:['🌿'],edgeColor:'#5a5a5a',motColor:'#6e9161'};
 const off=document.createElement('canvas'),offCtx=off.getContext('2d',{willReadFrequently:true});
-const mogCvs=document.createElement('canvas'),mogCtx=mogCvs.getContext('2d',{willReadFrequently:true});
 const recCvs=document.createElement('canvas'),recCtx=recCvs.getContext('2d');
+
+// ══ MODEL STATE ══
+let modelReady=false,segPending=false,segTimer=0;
+let SEG=null;
+const SEG_INTERVAL=80; // ~12fps segmentation max
+
+function loadScript(src){
+  return new Promise((res,rej)=>{
+    const s=document.createElement('script');s.src=src;s.onload=res;s.onerror=rej;document.head.appendChild(s);
+  });
+}
+
+async function loadModel(){
+  loadTagline.textContent='Loading MediaPipe…';
+  await loadScript('https://cdn.jsdelivr.net/npm/@mediapipe/selfie_segmentation@0.1/selfie_segmentation.js');
+  SEG=new window.SelfieSegmentation({
+    locateFile:(f)=>`https://cdn.jsdelivr.net/npm/@mediapipe/selfie_segmentation@0.1/${f}`
+  });
+  SEG.setOptions({modelSelection:1,selfieMode:false});
+  SEG.onResults(onSegResults);
+  await SEG.initialize();
+  modelReady=true;
+  loadProgressFill.style.width='100%';
+  loadTagline.textContent='MediaPipe ready';
+  segTimer=0;
+}
+
+// Reuse a persistent offscreen canvas to read mask pixels
+const segCvs=document.createElement('canvas');
+const segCtx=segCvs.getContext('2d',{willReadFrequently:true});
+
+function onSegResults(results){
+  const W=mc.width,H=mc.height;
+  segPending=false;
+  if(!results.segmentationMask||!W||!H)return;
+  const seg=results.segmentationMask;
+  const mW=seg.width||seg.videoWidth||W;
+  const mH=seg.height||seg.videoHeight||H;
+  if(!mW||!mH)return;
+  segCvs.width=mW;segCvs.height=mH;
+  segCtx.drawImage(seg,0,0,mW,mH);
+  const data=segCtx.getImageData(0,0,mW,mH).data;
+  const thr=Math.round(sensVal*1.2); // slider controls mask threshold
+  const newMask=new Uint8Array(W*H);
+  const scaleX=mW/W,scaleY=mH/H;
+  let filled=0;
+  for(let y=0;y<H;y++){
+    for(let x=0;x<W;x++){
+      const sx=Math.min(Math.floor(x*scaleX),mW-1);
+      const sy=Math.min(Math.floor(y*scaleY),mH-1);
+      const base=(sy*mW+sx)*4;
+      // Try R channel (greyscale mask) and alpha — whichever is non-zero
+      const v=Math.max(data[base],data[base+3]);
+      if(v>thr){newMask[y*W+x]=1;filled++;}
+    }
+  }
+  if(filled>50){
+    motMask=newMask;
+    frameCount=Math.max(frameCount,15);
+    zdot.className='zdot on';
+  }
+}
+
+function scheduleSeg(){
+  if(!modelReady||segPending||!mediaEl||mediaEl.paused)return;
+  const now=performance.now();
+  if(now-segTimer<SEG_INTERVAL)return;
+  segTimer=now;
+  segPending=true;
+  SEG.send({image:mediaEl}).catch(()=>{segPending=false;});
+}
 
 // ══ EYE ANIMATION ══
 // Iris positions relative to default x=340: [dx, dy]
@@ -766,7 +837,6 @@ function updateThresh(v){
     vtrackDot.style.left='50%';
     vtrackDot.style.transform='translateX(-50%)';
   }
-  if(cvReady)initMOG2();
 }
 
 let vDrag=false;
@@ -823,57 +893,6 @@ eCustom.addEventListener('keydown',e=>{
   if(!zone.emojis.includes(v)){if(zone.emojis.length>=5)zone.emojis.shift();zone.emojis.push(v);}
   buildTube();eCustom.value='';
 });
-
-// ══ OPENCV ══
-function loadCV(cb){
-  let ui=0;
-  function tryLoad(){
-    const s=document.createElement('script');s.async=true;
-    s.onload=()=>{
-      function w(n){
-        if(typeof cv!=='undefined'&&cv instanceof Promise){cv.then(r=>{window.cv=r;done();}).catch(fail);return;}
-        if(typeof cv!=='undefined'&&cv.Mat){done();return;}
-        if(n>130)return fail();
-        setTimeout(()=>w(n+1),100);
-      }w(0);
-    };
-    s.onerror=fail;s.src=CV_URLS[ui++];document.head.appendChild(s);
-  }
-  function fail(){if(ui<CV_URLS.length)tryLoad();}
-  function done(){cvReady=true;cb();}
-  tryLoad();
-}
-function sensToP(s){const t=s/100;return{h:Math.round(220-t*190),v:Math.round(50-t*40),a:0.038-t*0.035};}
-function initMOG2(){
-  if(mogSub){mogSub.delete();mogSub=null;}
-  const p=sensToP(sensVal);
-  mogSub=new cv.BackgroundSubtractorMOG2(p.h,p.v,false);
-  frameCount=0;motMask=null;
-}
-function processMOG2(W,H){
-  if(!cvReady||!mogSub)return;
-  const sc=1/3,mW=Math.round(W*sc),mH=Math.round(H*sc);
-  mogCvs.width=mW;mogCvs.height=mH;mogCtx.drawImage(mediaEl,0,0,mW,mH);
-  let src=null,fg=null,k=null,d=null;
-  try{
-    src=cv.imread(mogCvs);fg=new cv.Mat();mogSub.apply(src,fg);
-    k=cv.getStructuringElement(cv.MORPH_ELLIPSE,new cv.Size(5,5));d=new cv.Mat();
-    cv.morphologyEx(fg,d,cv.MORPH_OPEN,k);cv.dilate(d,d,k);
-    const lb=new cv.Mat(),st=new cv.Mat(),ce=new cv.Mat();
-    const nL=cv.connectedComponentsWithStats(d,lb,st,ce);
-    const pa=sensToP(sensVal),minA=pa.a*mW*mH,tot=mW*mH;
-    let bl=[];for(let i=1;i<nL;i++){const a=st.intAt(i,cv.CC_STAT_AREA);if(a>=minA&&a/tot<0.75)bl.push({i,a});}
-    bl.sort((a,b)=>b.a-a.a);const top=bl.slice(0,6);
-    const sm=new Uint8Array(mW*mH);
-    if(top.length){const ld=lb.data32S;const bs=new Set(top.map(b=>b.i));for(let i=0;i<mW*mH;i++)sm[i]=bs.has(ld[i])?1:0;}
-    if(!motMask||motMask.length!==W*H)motMask=new Uint8Array(W*H);
-    for(let py=0;py<H;py++)for(let px=0;px<W;px++)motMask[py*W+px]=sm[Math.min(Math.floor(py*sc),mH-1)*mW+Math.min(Math.floor(px*sc),mW-1)];
-    frameCount++;
-    zdot.className=top.length&&frameCount>=15?'zdot on':'zdot';
-    lb.delete();st.delete();ce.delete();
-  }catch(e){console.error(e);}
-  finally{if(src)src.delete();if(fg)fg.delete();if(k)k.delete();if(d)d.delete();}
-}
 
 // ══ TRIM ══
 const TINSET=16; // px inset from bar edges so thumbs aren't glued to border
@@ -932,11 +951,10 @@ $('tconfirmBtn').addEventListener('click',()=>{
   inStage=true;
   buildTube();
   loadClip();
-  if(!cvReady){
+  if(!modelReady){
     showScreen('s-load');
-    loadCV(()=>{initMOG2();showScreen('s-stage');});
+    loadModel().then(()=>showScreen('s-stage'));
   } else {
-    initMOG2();
     showScreen('s-stage');
   }
 });
@@ -1000,7 +1018,6 @@ function diffF(c,p,W,H){
 
 function startRender(){
   if(raf)cancelAnimationFrame(raf);
-  let mogC=0;
   function render(){
     const src=mediaEl;
     if(!src||src.paused||src.readyState<2){raf=requestAnimationFrame(render);return;}
@@ -1008,7 +1025,7 @@ function startRender(){
     off.width=W;off.height=H;offCtx.drawImage(src,0,0,W,H);
     const id=offCtx.getImageData(0,0,W,H);const px=id.data;_px=id;
     ctx.globalAlpha=VIDEO_DEF/100;ctx.globalCompositeOperation='source-over';ctx.drawImage(src,0,0,W,H);ctx.globalAlpha=1;
-    mogC++;if(mogC%2===0)processMOG2(W,H);
+    scheduleSeg();
     drawOverlay(W,H);
     const mf=prevPx&&prevPx.length===px.length?diffF(px,prevPx,W,H):null;
     prevPx=new Uint8ClampedArray(px);
@@ -1133,9 +1150,9 @@ function dlBlob(b,n){const a=document.createElement('a');a.href=URL.createObject
 function resetApp(){
   if(raf)cancelAnimationFrame(raf);
   if(mediaEl){mediaEl.pause();mediaEl.src='';mediaEl.ontimeupdate=null;}
-  if(mogSub){try{mogSub.delete();}catch(e){}mogSub=null;}
   mediaEl=null;prevPx=null;trailBuf=null;motMask=null;frameCount=0;playing=false;
-  inStage=false;cvReady=false;
+  inStage=false;
+  segPending=false;segTimer=0;
   zdot.className='zdot';
   ovCtx.clearRect(0,0,ov.width||1,ov.height||1);
   setPlayState(false);
